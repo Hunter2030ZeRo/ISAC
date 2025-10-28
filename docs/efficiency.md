@@ -6,6 +6,12 @@ The decoder stack combines several mechanisms to reduce the amount of compute th
 * **Grouped-query attention (GQA).** Keys and values are projected once per grouped head
   and then expanded to the query head count, which amortises the cost of building the
   KV cache compared to having dedicated key/value projections for every attention head.
+* **Token routers for gated attention and DeltaNet.** With the gated paths enabled by
+  default, each decoder layer predicts a per-token score. Tokens that fall below the
+  configured threshold are masked out so the attention and feed-forward branches can
+  skip their matrix multiplies for those positions. Only the routed tokens trigger the
+  expensive projections, mirroring the behaviour described in the Qwen3-Next model
+  card.
 * **Token routers for gated attention and DeltaNet.** When the gated paths are enabled
   in the configuration, each decoder layer predicts a per-token score. Tokens that fall
   below the configured threshold are masked out so the attention and feed-forward
