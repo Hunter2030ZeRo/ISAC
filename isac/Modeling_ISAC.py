@@ -430,7 +430,14 @@ class DecoderLayer(nn.Module):
 
         return mask
 
-    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions: bool = False,
+    ):
         residual = hidden_states
         normed_hidden = self.input_layernorm(hidden_states)
 
@@ -475,7 +482,10 @@ class DecoderLayer(nn.Module):
             mlp_output = self.mlp(normed_hidden)
             hidden_states = residual + mlp_output
 
-        return hidden_states, present_key_value
+        outputs: Tuple[torch.Tensor, ...] = (hidden_states, present_key_value)
+        if output_attentions:
+            outputs += (attn_weights,)
+        return outputs
 
 
 class CustomTransformerModel(PreTrainedModel):
@@ -495,13 +505,29 @@ class CustomTransformerModel(PreTrainedModel):
 
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        use_cache=None,
-    ):
-        batch_size, seq_length = input_ids.shape
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds")
+
+        if input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        elif inputs_embeds is not None:
+            batch_size, seq_length = inputs_embeds.shape[:2]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        output_attentions = bool(output_attentions) if output_attentions is not None else False
+        output_hidden_states = bool(output_hidden_states) if output_hidden_states is not None else False
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if position_ids is None:
             past_length = 0
@@ -511,29 +537,61 @@ class CustomTransformerModel(PreTrainedModel):
                 past_length, past_length + seq_length, dtype=torch.long, device=input_ids.device
             ).unsqueeze(0).expand(batch_size, -1)
 
-        hidden_states = self.embed_tokens(input_ids)
+        if inputs_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = inputs_embeds
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(hidden_states.device)
 
         next_decoder_cache = () if use_cache else None
+        all_hidden_states: Tuple[torch.Tensor, ...] = ()
+        all_self_attns: Tuple[torch.Tensor, ...] = ()
 
         for idx, decoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
-            hidden_states, present_key_value = decoder_layer(
+            layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_value,
+                output_attentions=output_attentions,
             )
+
+            hidden_states = layer_outputs[0]
+            present_key_value = layer_outputs[1]
+            attn_weights = layer_outputs[2] if output_attentions and len(layer_outputs) > 2 else None
 
             if use_cache:
                 next_decoder_cache += (present_key_value,)
 
+            if output_attentions:
+                all_self_attns += (attn_weights,)
+
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, next_decoder_cache
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        if not return_dict:
+            outputs: Tuple = (hidden_states, next_decoder_cache)
+            if output_hidden_states:
+                outputs += (all_hidden_states,)
+            if output_attentions:
+                outputs += (all_self_attns,)
+            return outputs
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_decoder_cache,
+            hidden_states=all_hidden_states if output_hidden_states else None,
+            attentions=all_self_attns if output_attentions else None,
+        )
 
 
 class CustomTransformerForCausalLM(PreTrainedModel, GenerationMixin):
@@ -571,24 +629,45 @@ class CustomTransformerForCausalLM(PreTrainedModel, GenerationMixin):
         attention_mask=None,
         position_ids=None,
         past_key_values=None,
+        inputs_embeds=None,
         labels=None,
         use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
         return_dict=None,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_attentions = bool(output_attentions) if output_attentions is not None else False
+        output_hidden_states = bool(output_hidden_states) if output_hidden_states is not None else False
 
         if self.gradient_checkpointing:
             use_cache = False
         elif use_cache is None:
             use_cache = getattr(self.config, "use_cache", True)
 
-        hidden_states, past_key_values = self.model(
+        model_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
         )
+
+        if return_dict:
+            hidden_states = model_outputs.last_hidden_state
+            past_key_values = model_outputs.past_key_values
+            all_hidden_states = model_outputs.hidden_states
+            all_attentions = model_outputs.attentions
+        else:
+            hidden_states = model_outputs[0]
+            past_key_values = model_outputs[1]
+            all_hidden_states = model_outputs[2] if output_hidden_states else None
+            attention_offset = 2 + (1 if output_hidden_states else 0)
+            all_attentions = model_outputs[attention_offset] if output_attentions else None
 
         logits = self.lm_head(hidden_states)
 
@@ -600,13 +679,19 @@ class CustomTransformerForCausalLM(PreTrainedModel, GenerationMixin):
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
         if not return_dict:
-            output = (logits,) + (past_key_values,)
+            output: Tuple = (logits, past_key_values)
+            if output_hidden_states:
+                output += (all_hidden_states,)
+            if output_attentions:
+                output += (all_attentions,)
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
         )
 
     @staticmethod
