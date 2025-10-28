@@ -57,7 +57,9 @@ class ModelConfig(PretrainedConfig):
         sliding_window: int | None = 32_000,
         tie_word_embeddings: bool = True,
         use_gated_attention: bool = False,
+        gated_attention_reduction: int = 16,
         use_gated_delta_net: bool = False,
+        gated_delta_net_reduction: int = 16,
         gated_delta_net_bias: bool = True,
         attention_dropout: float = 0.0,
         **kwargs,
@@ -82,7 +84,9 @@ class ModelConfig(PretrainedConfig):
         self.sliding_window = sliding_window
         self.tie_word_embeddings = tie_word_embeddings
         self.use_gated_attention = use_gated_attention
+        self.gated_attention_reduction = gated_attention_reduction
         self.use_gated_delta_net = use_gated_delta_net
+        self.gated_delta_net_reduction = gated_delta_net_reduction
         self.gated_delta_net_bias = gated_delta_net_bias
         self.attention_dropout = attention_dropout
 

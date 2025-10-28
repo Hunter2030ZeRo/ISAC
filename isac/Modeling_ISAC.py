@@ -74,15 +74,31 @@ class SwiGLU(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class GatedDeltaNet(nn.Module):
-    """Implements a lightweight Gated-DeltaNet style residual update."""
+class ResidualGate(nn.Module):
+    """Shared squeeze-and-gate block used by attention and feed-forward deltas."""
 
-    def __init__(self, hidden_size: int, bias: bool = True) -> None:
+    def __init__(self, hidden_size: int, reduction: int = 16, bias: bool = True) -> None:
         super().__init__()
-        self.gate = nn.Linear(hidden_size, hidden_size, bias=bias)
+        reduction = max(1, reduction)
+        reduced_dim = max(1, hidden_size // reduction)
+        self.down_proj = nn.Linear(hidden_size, reduced_dim, bias=bias)
+        self.act = nn.SiLU()
+        self.up_proj = nn.Linear(reduced_dim, hidden_size, bias=bias)
+
+    def forward(self, activations: torch.Tensor) -> torch.Tensor:
+        gate = self.up_proj(self.act(self.down_proj(activations)))
+        return torch.sigmoid(gate)
+
+
+class GatedDeltaNet(nn.Module):
+    """Implements an efficient Gated-DeltaNet style residual update."""
+
+    def __init__(self, hidden_size: int, reduction: int = 16, bias: bool = True) -> None:
+        super().__init__()
+        self.gate = ResidualGate(hidden_size, reduction=reduction, bias=bias)
 
     def forward(self, delta: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        gate = torch.sigmoid(self.gate(delta))
+        gate = self.gate(delta)
         return residual + gate * delta
 
 
@@ -208,9 +224,16 @@ class DecoderLayer(nn.Module):
         self.use_gated_attention = config.use_gated_attention
         self.use_gated_delta_net = config.use_gated_delta_net
         if self.use_gated_attention:
-            self.attn_gate_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+            self.attn_gate = ResidualGate(
+                config.hidden_size,
+                reduction=getattr(config, "gated_attention_reduction", 16),
+            )
         if self.use_gated_delta_net:
-            self.delta_net = GatedDeltaNet(config.hidden_size, bias=config.gated_delta_net_bias)
+            self.delta_net = GatedDeltaNet(
+                config.hidden_size,
+                reduction=getattr(config, "gated_delta_net_reduction", 16),
+                bias=config.gated_delta_net_bias,
+            )
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
         residual = hidden_states
@@ -222,7 +245,7 @@ class DecoderLayer(nn.Module):
             past_key_value=past_key_value,
         )
         if self.use_gated_attention:
-            gate = torch.sigmoid(self.attn_gate_proj(residual))
+            gate = self.attn_gate(hidden_states)
             hidden_states = hidden_states * gate
         hidden_states = residual + hidden_states
 
