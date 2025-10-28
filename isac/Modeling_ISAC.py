@@ -7,9 +7,10 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import CausalLMOutputWithPast, GenerationMixin, PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from .ISACConfig import ModelConfig
+from ISACConfig import ModelConfig
 
 
 class RMSNorm(nn.Module):
