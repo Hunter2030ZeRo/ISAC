@@ -32,6 +32,24 @@ class RotaryEmbedding(nn.Module):
         self.base = base
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("_cos_cached", None, persistent=False)
+        self.register_buffer("_sin_cached", None, persistent=False)
+        self._seq_len_cached: int = 0
+
+    def _build_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
+        if seq_len <= self._seq_len_cached:
+            if self._cos_cached is not None and self._sin_cached is not None:
+                if self._cos_cached.device == device and self._cos_cached.dtype == dtype:
+                    return
+
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1).to(dtype)
+        cos = emb.cos()[None, None, :, :]
+        sin = emb.sin()[None, None, :, :]
+        self.register_buffer("_cos_cached", cos, persistent=False)
+        self.register_buffer("_sin_cached", sin, persistent=False)
+        self._seq_len_cached = seq_len
 
     def forward(
         self,
@@ -39,18 +57,21 @@ class RotaryEmbedding(nn.Module):
         seq_len: int,
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = x.device
+        dtype = x.dtype
+        required_len = seq_len
         if position_ids is not None:
-            t = position_ids.to(self.inv_freq.device).float()
+            required_len = max(required_len, int(position_ids.max().item()) + 1)
+        required_len = min(required_len, self.max_position_embeddings)
+        self._build_cache(required_len, device=device, dtype=dtype)
+
+        if position_ids is not None:
+            cos = self._cos_cached[..., position_ids, :]
+            sin = self._sin_cached[..., position_ids, :]
         else:
-            t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
-
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        emb = emb.to(dtype=x.dtype)
-
-        cos = emb.cos()[None, None, :, :]
-        sin = emb.sin()[None, None, :, :]
-        return cos, sin
+            cos = self._cos_cached[..., :seq_len, :]
+            sin = self._sin_cached[..., :seq_len, :]
+        return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
 
 def rotate_half(x):
@@ -70,8 +91,47 @@ class SwiGLU(nn.Module):
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, x, token_mask: Optional[torch.Tensor] = None):
+        if token_mask is None or bool(token_mask.all()):
+            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+        output = torch.zeros_like(x)
+        flat_x = x.view(-1, x.size(-1))
+        flat_output = output.view(-1, output.size(-1))
+        flat_mask = token_mask.view(-1)
+        active_indices = torch.nonzero(flat_mask, as_tuple=False).squeeze(-1)
+        if active_indices.numel() == 0:
+            return output
+
+        active_hidden = flat_x.index_select(0, active_indices)
+        activated = F.silu(self.gate_proj(active_hidden)) * self.up_proj(active_hidden)
+        projected = self.down_proj(activated)
+        flat_output.index_copy_(0, active_indices, projected)
+        return output
+
+
+class TokenRouter(nn.Module):
+    """Predicts per-token gates following the Qwen3-Next routing strategy."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        reduction: int = 16,
+        bias: bool = True,
+        eps: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        reduction = max(1, reduction)
+        reduced_dim = max(1, hidden_size // reduction)
+        self.norm = RMSNorm(hidden_size, eps=eps)
+        self.down_proj = nn.Linear(hidden_size, reduced_dim, bias=bias)
+        self.act = nn.SiLU()
+        self.up_proj = nn.Linear(reduced_dim, 1, bias=bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        routed = self.norm(hidden_states)
+        routed = self.act(self.down_proj(routed))
+        return torch.sigmoid(self.up_proj(routed))
 
 
 class ResidualGate(nn.Module):
@@ -93,13 +153,44 @@ class ResidualGate(nn.Module):
 class GatedDeltaNet(nn.Module):
     """Implements an efficient Gated-DeltaNet style residual update."""
 
-    def __init__(self, hidden_size: int, reduction: int = 16, bias: bool = True) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        reduction: int = 16,
+        bias: bool = True,
+        use_residual_gate: bool = True,
+    ) -> None:
         super().__init__()
-        self.gate = ResidualGate(hidden_size, reduction=reduction, bias=bias)
+        self.gate = (
+            ResidualGate(hidden_size, reduction=reduction, bias=bias) if use_residual_gate else None
+        )
 
-    def forward(self, delta: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        gate = self.gate(delta)
-        return residual + gate * delta
+    def forward(
+        self,
+        delta: torch.Tensor,
+        residual: torch.Tensor,
+        gate_values: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        gate = gate_values
+        if self.gate is not None:
+            local_gate = self.gate(delta)
+            gate = local_gate if gate is None else gate * local_gate
+
+        if gate is None:
+            gate = 1.0
+
+        if token_mask is not None:
+            mask = token_mask.unsqueeze(-1).to(delta.dtype)
+            delta = delta * mask
+            if isinstance(gate, torch.Tensor):
+                gate = gate * mask
+            else:
+                gate = mask
+
+        if isinstance(gate, torch.Tensor):
+            return residual + gate * delta
+        return residual + delta
 
 
 class GroupedQueryAttention(nn.Module):
@@ -130,7 +221,15 @@ class GroupedQueryAttention(nn.Module):
           base=base,
       )
 
-    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        token_mask: Optional[torch.Tensor] = None,
+        router_scores: Optional[torch.Tensor] = None,
+    ):
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -198,18 +297,74 @@ class GroupedQueryAttention(nn.Module):
             attn_mask = combined_mask.expand(-1, self.num_heads, -1, -1)
 
         dropout_p = self.dropout if self.training else 0.0
-        attn_output = F.scaled_dot_product_attention(
-            query_states,
-            attn_key,
-            attn_value,
-            attn_mask=attn_mask,
-            dropout_p=dropout_p,
-            is_causal=True,
-        )
+        if token_mask is not None:
+            token_mask = token_mask.to(device=query_states.device)
+            if token_mask.dtype != torch.bool:
+                token_mask = token_mask > 0
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        if token_mask is not None and not bool(token_mask.all()):
+            attn_output = torch.zeros(bsz, q_len, self.hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
+            for batch_idx in range(bsz):
+                active = token_mask[batch_idx]
+                if active.all():
+                    q = query_states[batch_idx : batch_idx + 1]
+                    mask_b = attn_mask[batch_idx : batch_idx + 1] if attn_mask is not None else None
+                    attn_slice = F.scaled_dot_product_attention(
+                        q,
+                        attn_key[batch_idx : batch_idx + 1],
+                        attn_value[batch_idx : batch_idx + 1],
+                        attn_mask=mask_b,
+                        dropout_p=dropout_p,
+                        is_causal=True,
+                    )
+                    attn_slice = attn_slice.transpose(1, 2).contiguous().reshape(1, q_len, self.hidden_size)
+                    attn_output[batch_idx] = attn_slice[0]
+                    continue
+
+                if not active.any():
+                    continue
+
+                active_idx = torch.nonzero(active, as_tuple=False).squeeze(-1)
+                q = query_states[
+                    batch_idx : batch_idx + 1,
+                    :,
+                    active_idx,
+                    :,
+                ]
+                mask_b = None
+                if attn_mask is not None:
+                    mask_b = attn_mask[
+                        batch_idx : batch_idx + 1,
+                        :,
+                        active_idx,
+                        :,
+                    ]
+                attn_slice = F.scaled_dot_product_attention(
+                    q,
+                    attn_key[batch_idx : batch_idx + 1],
+                    attn_value[batch_idx : batch_idx + 1],
+                    attn_mask=mask_b,
+                    dropout_p=dropout_p,
+                    is_causal=True,
+                )
+                attn_slice = attn_slice.transpose(1, 2).contiguous().reshape(len(active_idx), self.hidden_size)
+                attn_output[batch_idx, active_idx] = attn_slice
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                attn_key,
+                attn_value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=True,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
         attn_output = self.o_proj(attn_output)
+
+        if router_scores is not None:
+            attn_output = attn_output * router_scores
 
         return attn_output, present_key_value
 
@@ -224,38 +379,100 @@ class DecoderLayer(nn.Module):
         self.use_gated_attention = config.use_gated_attention
         self.use_gated_delta_net = config.use_gated_delta_net
         if self.use_gated_attention:
-            self.attn_gate = ResidualGate(
+            self.attn_router = TokenRouter(
                 config.hidden_size,
                 reduction=getattr(config, "gated_attention_reduction", 16),
+                bias=False,
+                eps=config.rms_norm_eps,
             )
+            self.attn_threshold = getattr(config, "gated_attention_threshold", 0.0)
+            self.attn_min_tokens = getattr(config, "gated_attention_min_tokens", 0.0)
         if self.use_gated_delta_net:
+            self.delta_router = TokenRouter(
+                config.hidden_size,
+                reduction=getattr(config, "gated_delta_net_reduction", 16),
+                bias=config.gated_delta_net_bias,
+                eps=config.rms_norm_eps,
+            )
             self.delta_net = GatedDeltaNet(
                 config.hidden_size,
                 reduction=getattr(config, "gated_delta_net_reduction", 16),
                 bias=config.gated_delta_net_bias,
+                use_residual_gate=False,
             )
+            self.delta_threshold = getattr(config, "gated_delta_net_threshold", 0.0)
+            self.delta_min_tokens = getattr(config, "gated_delta_net_min_tokens", 0.0)
+
+    @staticmethod
+    def _compute_gate_mask(
+        gate_scores: torch.Tensor,
+        threshold: float,
+        min_tokens: float,
+    ) -> Optional[torch.Tensor]:
+        if gate_scores is None:
+            return None
+        values = gate_scores.squeeze(-1)
+        if threshold <= 0 and min_tokens <= 0:
+            return None
+
+        mask = values >= threshold
+
+        seq_len = values.size(-1)
+        if min_tokens > 0:
+            if min_tokens < 1:
+                keep = max(1, int(seq_len * min_tokens))
+            else:
+                keep = min(seq_len, int(min_tokens))
+            topk_values, _ = torch.topk(values, keep, dim=-1)
+            dynamic_threshold = topk_values[..., -1:]
+            mask = mask | (values >= dynamic_threshold)
+
+        return mask
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
+        normed_hidden = self.input_layernorm(hidden_states)
+
+        attn_router_scores = None
+        attn_token_mask = None
+        if self.use_gated_attention:
+            attn_router_scores = self.attn_router(normed_hidden)
+            attn_token_mask = self._compute_gate_mask(
+                attn_router_scores,
+                self.attn_threshold,
+                self.attn_min_tokens,
+            )
+
+        attn_output, present_key_value = self.self_attn(
+            hidden_states=normed_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
+            token_mask=attn_token_mask,
+            router_scores=attn_router_scores,
         )
-        if self.use_gated_attention:
-            gate = self.attn_gate(hidden_states)
-            hidden_states = hidden_states * gate
-        hidden_states = residual + hidden_states
+        hidden_states = residual + attn_output
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        normed_hidden = self.post_attention_layernorm(hidden_states)
+
         if self.use_gated_delta_net:
-            hidden_states = self.delta_net(hidden_states, residual)
+            delta_router_scores = self.delta_router(normed_hidden)
+            delta_token_mask = self._compute_gate_mask(
+                delta_router_scores,
+                self.delta_threshold,
+                self.delta_min_tokens,
+            )
+            mlp_output = self.mlp(normed_hidden, token_mask=delta_token_mask)
+            hidden_states = self.delta_net(
+                mlp_output,
+                residual,
+                gate_values=delta_router_scores,
+                token_mask=delta_token_mask,
+            )
         else:
-            hidden_states = residual + hidden_states
+            mlp_output = self.mlp(normed_hidden)
+            hidden_states = residual + mlp_output
 
         return hidden_states, present_key_value
 

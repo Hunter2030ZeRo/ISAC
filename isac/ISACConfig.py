@@ -58,9 +58,13 @@ class ModelConfig(PretrainedConfig):
         tie_word_embeddings: bool = True,
         use_gated_attention: bool = False,
         gated_attention_reduction: int = 16,
+        gated_attention_threshold: float = 0.25,
+        gated_attention_min_tokens: float = 0.05,
         use_gated_delta_net: bool = False,
         gated_delta_net_reduction: int = 16,
         gated_delta_net_bias: bool = True,
+        gated_delta_net_threshold: float = 0.25,
+        gated_delta_net_min_tokens: float = 0.05,
         attention_dropout: float = 0.0,
         **kwargs,
     ) -> None:
@@ -85,9 +89,13 @@ class ModelConfig(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         self.use_gated_attention = use_gated_attention
         self.gated_attention_reduction = gated_attention_reduction
+        self.gated_attention_threshold = gated_attention_threshold
+        self.gated_attention_min_tokens = gated_attention_min_tokens
         self.use_gated_delta_net = use_gated_delta_net
         self.gated_delta_net_reduction = gated_delta_net_reduction
         self.gated_delta_net_bias = gated_delta_net_bias
+        self.gated_delta_net_threshold = gated_delta_net_threshold
+        self.gated_delta_net_min_tokens = gated_delta_net_min_tokens
         self.attention_dropout = attention_dropout
 
         super().__init__(**kwargs)
