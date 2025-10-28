@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import CausalLMOutputWithPast, GenerationMixin, PreTrainedModel
-try:
-    from transformers.modeling_outputs import BaseModelOutputWithPast
-except ImportError:  # pragma: no cover - older Transformers versions
-    from transformers.modeling_outputs import ModelOutput as BaseModelOutputWithPast
+from transformers import GenerationMixin, PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 
-from .ISACConfig import ModelConfig
+from ISACConfig import ModelConfig
 
 
 class RMSNorm(nn.Module):
@@ -233,7 +230,6 @@ class GroupedQueryAttention(nn.Module):
         past_key_value=None,
         token_mask: Optional[torch.Tensor] = None,
         router_scores: Optional[torch.Tensor] = None,
-        output_attentions: bool = False,
     ):
         bsz, q_len, _ = hidden_states.size()
 
@@ -264,17 +260,24 @@ class GroupedQueryAttention(nn.Module):
             key_states = torch.cat([past_key, key_states], dim=2)
             value_states = torch.cat([past_value, value_states], dim=2)
 
-        if self.sliding_window is not None and key_states.size(2) > self.sliding_window:
-            key_states = key_states[:, :, -self.sliding_window :, :]
-            value_states = value_states[:, :, -self.sliding_window :, :]
-
         present_key_value = (key_states, value_states)
         kv_seq_len = key_states.size(2)
 
         attn_key = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
         attn_value = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
 
-        # Prepare attention mask for SDPA (causal + padding)
+        # Prepare attention mask for SDPA (causal + sliding window)
+        base_mask = None
+        if self.sliding_window is not None:
+            k_positions = torch.arange(kv_seq_len, device=query_states.device)
+            q_positions = k_positions[-q_len:]
+            if kv_seq_len > q_len:
+                q_positions = torch.arange(kv_seq_len - q_len, kv_seq_len, device=query_states.device)
+            distance = q_positions[:, None] - k_positions[None, :]
+            base = distance > self.sliding_window
+            base = base.to(query_states.device)
+            base_mask = base[None, None, :, :]
+
         pad_mask = None
         if isinstance(attention_mask, torch.Tensor):
             mask = (attention_mask == 0).to(device=query_states.device)
@@ -284,23 +287,21 @@ class GroupedQueryAttention(nn.Module):
             pad_mask = mask
 
         combined_mask = None
+        if base_mask is not None:
+            combined_mask = base_mask
         if pad_mask is not None:
             combined_mask = pad_mask if combined_mask is None else combined_mask | pad_mask
 
         attn_mask = None
-        if combined_mask is not None and torch.any(combined_mask):
-            attn_mask = combined_mask.expand(bsz, 1, q_len, kv_seq_len)
-
-        if attn_mask is not None and not torch.any(attn_mask):
-            attn_mask = None
+        if combined_mask is not None:
+            combined_mask = combined_mask.expand(bsz, 1, q_len, kv_seq_len)
+            attn_mask = combined_mask.expand(-1, self.num_heads, -1, -1)
 
         dropout_p = self.dropout if self.training else 0.0
         if token_mask is not None:
             token_mask = token_mask.to(device=query_states.device)
             if token_mask.dtype != torch.bool:
                 token_mask = token_mask > 0
-
-        attn_weights: Optional[torch.Tensor] = None
 
         if token_mask is not None and not bool(token_mask.all()):
             attn_output = torch.zeros(bsz, q_len, self.hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
@@ -339,8 +340,6 @@ class GroupedQueryAttention(nn.Module):
                         active_idx,
                         :,
                     ]
-                    if not torch.any(mask_b):
-                        mask_b = None
                 attn_slice = F.scaled_dot_product_attention(
                     q,
                     attn_key[batch_idx : batch_idx + 1],
@@ -363,20 +362,12 @@ class GroupedQueryAttention(nn.Module):
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
-            if output_attentions:
-                scale = float(self.head_dim) ** -0.5
-                query_states_scaled = query_states * scale
-                attn_weights = torch.matmul(query_states_scaled, attn_key.transpose(-2, -1))
-                if attn_mask is not None:
-                    attn_weights = attn_weights.masked_fill(attn_mask, float("-inf"))
-                attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
         attn_output = self.o_proj(attn_output)
 
         if router_scores is not None:
             attn_output = attn_output * router_scores
 
-        return attn_output, present_key_value, attn_weights if output_attentions else None
+        return attn_output, present_key_value
 
 
 class DecoderLayer(nn.Module):
@@ -460,14 +451,13 @@ class DecoderLayer(nn.Module):
                 self.attn_min_tokens,
             )
 
-        attn_output, present_key_value, attn_weights = self.self_attn(
+        attn_output, present_key_value = self.self_attn(
             hidden_states=normed_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             token_mask=attn_token_mask,
             router_scores=attn_router_scores,
-            output_attentions=output_attentions,
         )
         hidden_states = residual + attn_output
 
@@ -543,18 +533,14 @@ class CustomTransformerModel(PreTrainedModel):
             past_length = 0
             if past_key_values is not None and len(past_key_values) > 0:
                 past_length = past_key_values[0][0].shape[2]
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(
-                past_length, past_length + seq_length, dtype=torch.long, device=device
+                past_length, past_length + seq_length, dtype=torch.long, device=input_ids.device
             ).unsqueeze(0).expand(batch_size, -1)
 
         if inputs_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = inputs_embeds
-
-        if use_cache is None:
-            use_cache = getattr(self.config, "use_cache", True)
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(hidden_states.device)

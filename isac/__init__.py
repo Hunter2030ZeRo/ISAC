@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from .ISACConfig import ModelConfig, tokenizer, vocab
-from .Modeling_ISAC import CustomTransformerForCausalLM
+from ISACConfig import ModelConfig, tokenizer, vocab
+from Modeling_ISAC import CustomTransformerForCausalLM
 
 __all__ = [
     "CustomTransformerForCausalLM",
