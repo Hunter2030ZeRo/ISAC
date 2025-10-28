@@ -1,11 +1,22 @@
-from Modeling_ISAC import CustomTransformerForCausalLM
-from ISACConfig import ModelConfig, tokenizer, vocab
-from concurrent.futures import ThreadPoolExecutor
+"""Public package surface for the ISAC 3B model."""
+
+from __future__ import annotations
+
 from transformers import AutoConfig, AutoModelForCausalLM
 
-with ThreadPoolExecutor(max_workers=os.cpu_count()-2) as executor:
-    if len(tokenizer) > vocab:
-        tokenizer.add_tokens([f"<extra_{i}>" for i in range(vocab - len(tokenizer))])
+from .ISACConfig import ModelConfig, tokenizer, vocab
+from .Modeling_ISAC import CustomTransformerForCausalLM
 
-AutoConfig.register("custom_transformer", ModelConfig)
+__all__ = [
+    "CustomTransformerForCausalLM",
+    "ModelConfig",
+    "tokenizer",
+    "vocab",
+]
+
+
+# Ensure that Hugging Face can locate the custom architecture through the standard
+# registration hooks.  This mirrors the behaviour of upstream transformer packages and
+# keeps the implementation compatible with AutoModel / AutoConfig factories.
+AutoConfig.register(ModelConfig.model_type, ModelConfig)
 AutoModelForCausalLM.register(ModelConfig, CustomTransformerForCausalLM)
